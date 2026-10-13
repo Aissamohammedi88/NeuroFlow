@@ -1,0 +1,709 @@
+#!/usr/bin/env python3# -*- coding: utf-8 -*-
+"""
+NEXUS LIVE AI ULTIMATE v2.0.0
+Auteur : Aissa Mohammedi
+Protocole : Code Nametron 3 Lara / ZTMESH v1.5.15
+Licence : Apache-2.0
+Port : 9070
+
+Interface live IA complete avec :
+- Backend HTTP + WebSocket-like (SSE)
+- Frontend Three.js (scène 3D)
+- Multi-sessions persistantes (JSONL + SQLite)
+- Moteur de réponse local (règles + templates + heuristiques)
+- Monitoring système temps réel
+- API REST complète
+- CLI (chat, stats, sessions)
+- Export Markdown/JSON
+- Recherche full-text dans l'historique
+- Rate limiting + auth par token
+- Compression gzip
+- CORS
+- Plugins hooks
+- Backup automatique
+- Multi-langue (fr/en)
+- Thème dynamique
+"""
+
+import argparse
+import base64
+import collections
+import datetime
+import functools
+import gzip
+import hashlib
+import io
+import json
+import logging
+import math
+import os
+import queue
+import random
+import re
+import secrets
+import shutil
+import signal
+import sqlite3
+import string
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+import zlib
+from dataclasses import dataclass, asdict, field
+from enum import Enum
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+# ═══════════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════════
+
+VERSION = "2.0.0"
+BUILD = "2026.09.25"
+LICENSE = "Apache-2.0"
+PROTOCOL = "Code Nametron 3 Lara / ZTMESH v1.5.15"
+
+PORT_DEFAULT = 9070
+HOST_DEFAULT = "0.0.0.0"
+
+OUT = Path.home() / "nexus_live_ai"
+OUT.mkdir(parents=True, exist_ok=True)
+LOG = OUT / "live_ai.log"
+HIST = OUT / "history.jsonl"
+DB = OUT / "sessions.db"
+BACKUP = OUT / "backup"
+BACKUP.mkdir(exist_ok=True)
+
+MAX_BODY = 10 * 1024 * 1024
+RATE_LIMIT_WINDOW = 60
+RATE_LIMIT_MAX = 120
+TOKEN_TTL = 86400
+MAX_MESSAGES_PER_SESSION = 5000
+KEEP_BACKUPS = 5
+
+logging.basicConfig(level=logging.INFO, format='{"ts":"%(asctime)s","lvl":"%(levelname)s","msg":"%(message)s"}')
+log = logging.getLogger("liveai")
+
+
+def logl(msg: str, **extra: Any) -> None:
+payload = {"msg": msg}
+payload.update(extra)
+log.info(json.dumps(payload, default=str))
+try:
+with open(LOG, "a", encoding="utf-8") as f:
+f.write(datetime.datetime.now(datetime.timezone.utc).isoformat() + " " + json.dumps(payload, default=str) + "\n")
+except OSError:
+pass
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SQLITE
+# ═══════════════════════════════════════════════════════════════════
+
+class DBManager:
+def __init__(self, path: Path):
+self.path = path
+self.lock = threading.RLock()
+self.conn = sqlite3.connect(str(path), check_same_thread=False, timeout=30)
+self.conn.row_factory = sqlite3.Row
+self._migrate()
+
+def _migrate(self):
+with self.lock:
+self.conn.executescript("""
+CREATE TABLE IF NOT EXISTS sessions (
+id TEXT PRIMARY KEY,
+nom TEXT NOT NULL,
+cree TEXT NOT NULL,
+updated TEXT NOT NULL,
+messages_count INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS messages (
+id TEXT PRIMARY KEY,
+session_id TEXT NOT NULL,
+role TEXT NOT NULL,
+contenu TEXT NOT NULL,
+timestamp TEXT NOT NULL,
+tokens INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS events (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+ts TEXT NOT NULL,
+type TEXT NOT NULL,
+data TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_msg_session ON messages(session_id);
+CREATE INDEX IF NOT EXISTS idx_msg_ts ON messages(timestamp);
+CREATE INDEX IF NOT EXISTS idx_evt_ts ON events(ts);
+""")
+self.conn.commit()
+
+def execute(self, sql: str, params: Tuple = ()) -> sqlite3.Cursor:
+with self.lock:
+cur = self.conn.execute(sql, params)
+self.conn.commit()
+return cur
+
+def query(self, sql: str, params: Tuple = ()) -> List[sqlite3.Row]:
+with self.lock:
+return self.conn.execute(sql, params).fetchall()
+
+def log_event(self, type_: str, data: str = ""):
+self.execute("INSERT INTO events(ts,type,data) VALUES(?,?,?)",
+(datetime.datetime.now(datetime.timezone.utc).isoformat(), type_, data))
+
+def upsert_session(self, sid: str, nom: str, cree: str):
+self.execute(
+"INSERT OR IGNORE INTO sessions(id,nom,cree,updated,messages_count) VALUES(?,?,?,?,0)",
+(sid, nom, cree, cree),
+)
+
+def incr_session_messages(self, sid: str):
+self.execute("UPDATE sessions SET messages_count = messages_count + 1, updated = ? WHERE id = ?",
+(datetime.datetime.now(datetime.timezone.utc).isoformat(), sid))
+
+def insert_message(self, m: "Message", sid: str):
+self.execute(
+"INSERT OR REPLACE INTO messages(id,session_id,role,contenu,timestamp,tokens) VALUES(?,?,?,?,?,?)",
+(m.id, sid, m.role, m.contenu, m.timestamp, m.tokens),
+)
+
+def get_messages(self, sid: str, limit: int = 1000) -> List[Dict[str, Any]]:
+rows = self.query("SELECT id,role,contenu,timestamp,tokens FROM messages WHERE session_id=? ORDER BY timestamp ASC LIMIT ?", (sid, limit))
+return [dict(r) for r in rows]
+
+def list_sessions(self) -> List[Dict[str, Any]]:
+rows = self.query("SELECT id,nom,cree,updated,messages_count FROM sessions ORDER BY updated DESC")
+return [dict(r) for r in rows]
+
+def delete_session(self, sid: str):
+self.execute("DELETE FROM messages WHERE session_id=?", (sid,))
+self.execute("DELETE FROM sessions WHERE id=?", (sid,))
+
+def search(self, query: str, limit: int = 100) -> List[Dict[str, Any]]:
+rows = self.query(
+"SELECT session_id,id,role,contenu,timestamp FROM messages WHERE contenu LIKE ? ORDER BY timestamp DESC LIMIT ?",
+("%" + query + "%", limit),
+)
+return [dict(r) for r in rows]
+
+def stats(self) -> Dict[str, Any]:
+s = self.query("SELECT COUNT(*) AS n FROM sessions")[0]["n"]
+m = self.query("SELECT COUNT(*) AS n FROM messages")[0]["n"]
+e = self.query("SELECT COUNT(*) AS n FROM events")[0]["n"]
+return {"sessions": s, "messages": m, "events": e}
+
+def close(self):
+with self.lock:
+self.conn.close()
+
+
+DBM: DBManager = None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MODELS
+# ═══════════════════════════════════════════════════════════════════
+
+@dataclass
+class Message:
+id: str
+role: str
+contenu: str
+timestamp: str
+tokens: int = 0
+
+
+@dataclass
+class Session:
+id: str
+nom: str
+cree: str
+messages: List[Message] = field(default_factory=list)
+
+
+SESSIONS: Dict[str, Session] = {}
+SESSIONS_LOCK = threading.RLock()
+
+
+def get_session(sid: Optional[str]) -> Session:
+with SESSIONS_LOCK:
+if sid and sid in SESSIONS:
+return SESSIONS[sid]
+if sid:
+rows = DBM.query("SELECT id,nom,cree FROM sessions WHERE id=?", (sid,))
+if rows:
+s = Session(id=rows[0]["id"], nom=rows[0]["nom"], cree=rows[0]["cree"])
+for m in DBM.get_messages(s.id):
+s.messages.append(Message(**m))
+SESSIONS[s.id] = s
+return s
+nid = str(uuid.uuid4())[:8]
+now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+s = Session(id=nid, nom="Session " + nid, cree=now)
+SESSIONS[nid] = s
+DBM.upsert_session(nid, s.nom, now)
+return s
+
+
+def ajouter_message(sid: str, role: str, contenu: str) -> Message:
+s = get_session(sid)
+m = Message(
+id=str(uuid.uuid4())[:12],
+role=role,
+contenu=contenu,
+timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+tokens=len(contenu.split()),
+)
+with SESSIONS_LOCK:
+s.messages.append(m)
+if len(s.messages) > MAX_MESSAGES_PER_SESSION:
+s.messages = s.messages[-MAX_MESSAGES_PER_SESSION:]
+DBM.insert_message(m, sid)
+DBM.incr_session_messages(sid)
+try:
+with open(HIST, "a", encoding="utf-8") as f:
+f.write(json.dumps({"session": sid, **asdict(m)}, ensure_ascii=False) + "\n")
+except OSError:
+pass
+return m
+
+
+# ═══════════════════════════════════════════════════════════════════
+# REPONSE ENGINE
+# ═══════════════════════════════════════════════════════════════════
+
+INTENTS = [
+(["bonjour", "salut", "hello", "bonsoir", "coucou"], "greeting"),
+(["qui es tu", "qui es-tu", "tu es qui", "ton nom"], "identity"),
+(["aide", "help", "que peux tu"], "help"),
+(["code", "python", "javascript", "script", "fonction"], "code"),
+(["resume", "resumer", "condense"], "summary"),
+(["heure", "time", "quelle heure"], "time"),
+(["date", "jour", "quel jour"], "date"),
+(["stats", "statistiques", "systeme"], "stats"),
+(["merci", "thanks"], "thanks"),
+(["au revoir", "bye", "a plus"], "goodbye"),
+(["traduit", "traduction", "translate"], "translate"),
+(["explique", "explique moi", "definition"], "explain"),
+(["compare", "difference", "versus"], "compare"),
+(["liste", "list", "enumere"], "list"),
+(["erreur", "bug", "probleme"], "debug"),
+(["securite", "security", "faille"], "security"),
+]
+
+RESPONSES = {
+"greeting": [
+"Bonjour. Je suis Nexus Live AI. Comment puis-je aider ?",
+"Salut. Pret a t'aider.",
+"Bonjour, partenaire. Que veux-tu construire aujourd'hui ?",
+],
+"identity": [
+"Je suis Nexus Live AI v" + VERSION + ", interface temps reel construite par Aissa Mohammedi, protocole Nametron 3 Lara.",
+],
+"help": [
+"Je peux : analyser du code, expliquer des concepts, generer des scripts, resumer du texte, comparer des options, debogguer, et plus.",
+],
+"code": [
+"Voici une base :\n\n```python\ndef hello():\n print('Nexus')\n```\nAdapte selon ton besoin.",
+],
+"summary": [
+"Donne-moi le texte a condenser, je te fais un resume structure en 3 points cles.",
+],
+"time": ["Il est " + datetime.datetime.now().strftime("%H:%M:%S") + "."],
+"date": ["Nous sommes le " + datetime.datetime.now().strftime("%d/%m/%Y") + "."],
+"stats": ["Je collecte les stats systeme. Va sur le panneau Monitoring a droite."],
+"thanks": ["Avec plaisir."],
+"goodbye": ["A bientot, partenaire."],
+"translate": ["Donne-moi le texte et la langue cible."],
+"explain": ["Je peux expliquer un concept en 3 niveaux : simple, intermediaire, expert. Lequel ?"],
+"compare": ["Donne-moi les 2 elements a comparer et les criteres."],
+"list": ["Donne-moi le sujet, je te fais une liste structuree."],
+"debug": ["Colle-moi le code et le message d'erreur."],
+"security": ["Pour un audit securite, decris la cible et l'environnement."],
+}
+
+DEFAULT_RESPONSES = [
+"Analyse : la demande porte sur '{prompt}'.\n1. Contexte collecte ({n} messages).\n2. Reformulation : comprendre, structurer, repondre.\n3. Reponse : peux-tu preciser ?",
+"J'ai bien recu : '{prompt}'.\nPour avancer : donne-moi plus de contexte ou un exemple concret.",
+"Requete '{prompt}' enregistree.\nJe propose : decomposer en sous-problemes, identifier les contraintes, produire un plan.",
+]
+
+
+def detect_intent(prompt: str) -> str:
+p = prompt.lower()
+for keywords, intent in INTENTS:
+for k in keywords:
+if k in p:
+return intent
+return "default"
+
+
+def reponse_locale(prompt: str, contexte: List[Message]) -> str:
+if not prompt or not prompt.strip():
+return "Pose-moi une question."
+intent = detect_intent(prompt)
+if intent in RESPONSES:
+return random.choice(RESPONSES[intent])
+return random.choice(DEFAULT_RESPONSES).format(prompt=prompt[:120], n=len(contexte))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STATS SYSTEME
+# ═══════════════════════════════════════════════════════════════════
+
+def lire_stats() -> Dict[str, Any]:
+stats = {"cpu": 0.0, "ram": 0.0, "disk": 0.0, "uptime": 0, "load": [0, 0, 0], "ts": time.time()}
+try:
+import psutil
+stats["cpu"] = psutil.cpu_percent(interval=None)
+stats["ram"] = psutil.virtual_memory().percent
+stats["disk"] = psutil.disk_usage("/").percent
+stats["uptime"] = int(time.time() - psutil.boot_time())
+stats["load"] = [round(x, 2) for x in psutil.getloadavg()]
+except Exception:
+try:
+with open("/proc/loadavg") as f:
+parts = f.read().split()
+stats["cpu"] = float(parts[0]) * 10
+stats["load"] = [float(parts[0]), float(parts[1]), float(parts[2])]
+with open("/proc/uptime") as f:
+stats["uptime"] = int(float(f.read().split()[0]))
+with open("/proc/meminfo") as f:
+mem = {}
+for line in f:
+if ":" in line:
+k, v = line.split(":", 1)
+mem[k.strip()] = v.strip()
+total = int(mem.get("MemTotal", "1").split()[0])
+avail = int(mem.get("MemAvailable", "0").split()[0])
+if total > 0:
+stats["ram"] = round((total - avail) / total * 100, 2)
+except Exception:
+pass
+return stats
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SSE (Server-Sent Events)
+# ═══════════════════════════════════════════════════════════════════
+
+class SSEManager:
+def __init__(self):
+self.clients: List[queue.Queue] = []
+self.lock = threading.RLock()
+
+def subscribe(self) -> queue.Queue:
+q: queue.Queue = queue.Queue(maxsize=100)
+with self.lock:
+self.clients.append(q)
+return q
+
+def unsubscribe(self, q: queue.Queue):
+with self.lock:
+if q in self.clients:
+self.clients.remove(q)
+
+def broadcast(self, event: str, data: Any):
+msg = f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+with self.lock:
+for q in list(self.clients):
+try:
+q.put_nowait(msg)
+except queue.Full:
+pass
+
+
+SSE = SSEManager()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# RATE LIMIT
+# ═══════════════════════════════════════════════════════════════════
+
+class RateLimiter:
+def __init__(self, window: int = RATE_LIMIT_WINDOW, max_req: int = RATE_LIMIT_MAX):
+self.window = window
+self.max_req = max_req
+self.hits: Dict[str, collections.deque] = {}
+self.lock = threading.RLock()
+
+def allow(self, key: str) -> bool:
+now = time.time()
+with self.lock:
+q = self.hits.setdefault(key, collections.deque())
+while q and now - q[0] > self.window:
+q.popleft()
+if len(q) >= self.max_req:
+return False
+q.append(now)
+return True
+
+
+RL = RateLimiter()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# HTML
+# ═══════════════════════════════════════════════════════════════════
+
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nexus Live AI v2.0.0</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+:root{
+--bg:#05050a; --panel:rgba(15,15,25,0.75); --accent:#00f0ff; --accent2:#ff00c8;
+--text:#e0e0e0; --muted:#8892a6; --border:rgba(0,240,255,0.25);
+}
+*{margin:0;padding:0;box-sizing:border-box;font-family:-apple-system,'SF Pro',Inter,sans-serif}
+html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text)}
+#bg3d{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0}
+#app{position:relative;z-index:2;display:grid;grid-template-columns:260px 1fr 320px;height:100vh;gap:12px;padding:12px}
+.panel{background:var(--panel);backdrop-filter:blur(18px);border:1px solid var(--border);border-radius:16px;padding:16px;overflow:hidden;display:flex;flex-direction:column}
+.header{display:flex;align-items:center;gap:10px;padding-bottom:12px;border-bottom:1px solid var(--border)}
+.logo{width:36px;height:36px;border-radius:10px;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;font-weight:700;color:#000}
+.title{font-weight:700;font-size:1.05rem;background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent}
+.subtitle{font-size:0.7rem;color:var(--muted)}
+.sessions{flex:1;overflow-y:auto;margin-top:12px}
+.session{padding:10px 12px;border-radius:10px;cursor:pointer;font-size:0.85rem;border:1px solid transparent;transition:all .2s;margin-bottom:6px}
+.session:hover,.session.active{background:rgba(0,240,255,0.08);border-color:var(--border);color:var(--accent)}
+.session .del{float:right;color:var(--accent2);opacity:0.5}
+.session .del:hover{opacity:1}
+.new-btn{margin-top:12px;padding:10px;border-radius:10px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#000;font-weight:600;border:none;cursor:pointer}
+.chat{display:flex;flex-direction:column;gap:10px}
+.messages{flex:1;overflow-y:auto;padding:12px 4px;display:flex;flex-direction:column;gap:14px}
+.msg{display:flex;gap:10px;max-width:90%}
+.msg.user{align-self:flex-end;flex-direction:row-reverse}
+.msg.assistant{align-self:flex-start}
+.avatar{width:32px;height:32px;border-radius:50%;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:0.75rem}
+.msg.user .avatar{background:linear-gradient(135deg,var(--accent2),#ff77dd);color:#000}
+.msg.assistant .avatar{background:linear-gradient(135deg,var(--accent),#88ffff);color:#000}
+.bubble{padding:12px 14px;border-radius:14px;font-size:0.9rem;line-height:1.5;white-space:pre-wrap;word-wrap:break-word}
+.msg.user .bubble{background:rgba(255,0,200,0.12);border:1px solid rgba(255,0,200,0.3)}
+.msg.assistant .bubble{background:rgba(0,240,255,0.08);border:1px solid var(--border)}
+.input-area{margin-top:12px;display:flex;gap:10px;align-items:flex-end}
+textarea{flex:1;background:rgba(0,0,0,0.4);border:1px solid var(--border);border-radius:14px;padding:12px 14px;color:var(--text);resize:none;font-size:0.9rem;min-height:50px;max-height:160px;outline:none;font-family:inherit}
+textarea:focus{border-color:var(--accent)}
+.send{width:50px;height:50px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2));border:none;cursor:pointer;font-size:1.3rem;color:#000;flex-shrink:0}
+.send:disabled{opacity:0.4;cursor:not-allowed}
+.stats{display:flex;flex-direction:column;gap:14px}
+.stat{background:rgba(0,0,0,0.25);border:1px solid var(--border);border-radius:12px;padding:12px}
+.stat-label{font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em}
+.stat-value{font-size:1.6rem;font-weight:700;color:var(--accent);margin-top:4px}
+.progress{height:6px;background:rgba(0,0,0,0.4);border-radius:3px;margin-top:8px;overflow:hidden}
+.progress > div{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .4s ease}
+.chart{height:120px;margin-top:8px;width:100%}
+.search-box{margin-top:10px;padding:8px 12px;border-radius:10px;background:rgba(0,0,0,0.4);border:1px solid var(--border);color:var(--text);font-size:0.85rem;outline:none;width:100%}
+.search-results{margin-top:10px;max-height:200px;overflow-y:auto;font-size:0.75rem;color:var(--muted)}
+.search-results div{padding:6px 8px;border-bottom:1px solid rgba(255,255,255,0.05)}
+.typing{display:inline-block;width:8px;height:14px;background:var(--accent);animation:blink 1s infinite}
+@keyframes blink{0%,50%{opacity:1}51%,100%{opacity:0}}
+::-webkit-scrollbar{width:6px}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+@media(max-width:900px){#app{grid-template-columns:1fr}.panel.side{display:none}}
+</style>
+</head>
+<body>
+<canvas id="bg3d"></canvas>
+<div id="app">
+<aside class="panel side">
+<div class="header">
+<div class="logo">N</div>
+<div>
+<div class="title">Nexus Live AI</div>
+<div class="subtitle">v2.0.0 - Sessions &amp; Historique</div>
+</div>
+</div>
+<input class="search-box" id="search" placeholder="Rechercher dans l'historique..." oninput="rechercher(this.value)">
+<div class="search-results" id="search-results"></div>
+<div class="sessions" id="sessions"></div>
+<button class="new-btn" onclick="nouvelleSession()">+ Nouvelle session</button>
+</aside>
+<main class="panel chat">
+<div class="header">
+<div class="logo">⚡</div>
+<div>
+<div class="title">Conversation temps reel</div>
+<div class="subtitle" id="session-info">Session courante</div>
+</div>
+</div>
+<div class="messages" id="messages"></div>
+<div class="input-area">
+<textarea id="input" placeholder="Pose ta question... (Entree pour envoyer, Shift+Entree pour nouvelle ligne)" rows="1" oninput="autoGrow(this)"></textarea>
+<button class="send" id="send" onclick="envoyer()">➤</button>
+</div>
+</main>
+<aside class="panel side">
+<div class="header">
+<div class="logo">📊</div>
+<div>
+<div class="title">Monitoring Live</div>
+<div class="subtitle" id="ts">--:--:--</div>
+</div>
+</div>
+<div class="stats">
+<div class="stat">
+<div class="stat-label">CPU</div>
+<div class="stat-value" id="cpu">0%</div>
+<div class="progress"><div id="cpu-bar" style="width:0%"></div></div>
+</div>
+<div class="stat">
+<div class="stat-label">RAM</div>
+<div class="stat-value" id="ram">0%</div>
+<div class="progress"><div id="ram-bar" style="width:0%"></div></div>
+</div>
+<div class="stat">
+<div class="stat-label">Disque</div>
+<div class="stat-value" id="disk">0%</div>
+<div class="progress"><div id="disk-bar" style="width:0%"></div></div>
+</div>
+<div class="stat">
+<div class="stat-label">Uptime</div>
+<div class="stat-value" id="uptime">0s</div>
+</div>
+<div class="stat">
+<div class="stat-label">Load Avg</div>
+<div class="stat-value" id="load" style="font-size:1rem">0 / 0 / 0</div>
+</div>
+<canvas class="chart" id="chart"></canvas>
+</div>
+</aside>
+</div>
+<script>
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+const renderer = new THREE.WebGLRenderer({canvas: document.getElementById('bg3d'), alpha:true, antialias:true});
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+camera.position.z = 6;
+
+const geo = new THREE.BufferGeometry();
+const N = 1500;
+const pos = new Float32Array(N*3);
+for (let i=0;i<N;i++){
+pos[i*3] = (Math.random()-0.5)*20;
+pos[i*3+1] = (Math.random()-0.5)*20;
+pos[i*3+2] = (Math.random()-0.5)*20;
+}
+geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+const mat = new THREE.PointsMaterial({size:0.035, color:0x00f0ff, transparent:true, opacity:0.8, blending:THREE.AdditiveBlending});
+const points = new THREE.Points(geo, mat);
+scene.add(points);
+
+const geo2 = new THREE.BufferGeometry();
+const pos2 = new Float32Array(600*3);
+for (let i=0;i<600;i++){
+pos2[i*3] = (Math.random()-0.5)*25;
+pos2[i*3+1] = (Math.random()-0.5)*25;
+pos2[i*3+2] = (Math.random()-0.5)*25;
+}
+geo2.setAttribute('position', new THREE.BufferAttribute(pos2, 3));
+const mat2 = new THREE.PointsMaterial({size:0.02, color:0xff00c8, transparent:true, opacity:0.6, blending:THREE.AdditiveBlending});
+const points2 = new THREE.Points(geo2, mat2);
+scene.add(points2);
+
+let t = 0;
+function anim(){
+requestAnimationFrame(anim);
+t += 0.005;
+points.rotation.y = t;
+points.rotation.x = t*0.7;
+points2.rotation.y = -t*0.8;
+points2.rotation.z = t*0.5;
+renderer.render(scene, camera);
+}
+anim();
+window.addEventListener('resize', ()=>{
+camera.aspect = window.innerWidth/window.innerHeight;
+camera.updateProjectionMatrix();
+renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+let session = null;
+let sessions = {};
+
+function autoGrow(el){
+el.style.height = 'auto';
+el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+}
+
+function escapeHtml(s){
+return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function afficherMessage(role, contenu){
+const box = document.getElementById('messages');
+const div = document.createElement('div');
+div.className = 'msg ' + role;
+const av = role === 'user' ? 'M' : 'AI';
+div.innerHTML = '<div class="avatar">'+av+'</div><div class="bubble"></div>';
+div.querySelector('.bubble').textContent = contenu;
+box.appendChild(div);
+box.scrollTop = box.scrollHeight;
+}
+
+async function envoyer(){
+const input = document.getElementById('input');
+const txt = input.value.trim();
+if (!txt) return;
+input.value = '';
+autoGrow(input);
+afficherMessage('user', txt);
+document.getElementById('send').disabled = true;
+
+const box = document.getElementById('messages');
+const loading = document.createElement('div');
+loading.className = 'msg assistant';
+loading.innerHTML = '<div class="avatar">AI</div><div class="bubble"><span class="typing"></span></div>';
+box.appendChild(loading);
+box.scrollTop = box.scrollHeight;
+
+try {
+const r = await fetch('/api/chat', {
+method:'POST',
+headers:{'Content-Type':'application/json'},
+body: JSON.stringify({message: txt, session: session})
+});
+const data = await r.json();
+box.removeChild(loading);
+if (data.reponse) afficherMessage('assistant', data.reponse);
+if (data.session) { session = data.session; }
+chargerSessions();
+} catch(e){
+box.removeChild(loading);
+afficherMessage('assistant', 'Erreur reseau.');
+}
+document.getElementById('send').disabled = false;
+}
+
+async function chargerSessions(){
+try {
+const r = await fetch('/api/sessions');
+const data = await r.json();
+sessions = data.sessions || {};
+const box = document.getElementById('sessions');
+box.innerHTML = '';
+Object.values(sessions).forEach(s=>{
+const d = document.createElement('div');
+d.className = 'session' + (session === s.id ? ' active' : '');
+d.innerHTML = '<span>' + s.nom + ' (' + s.messages_count + ')</span><span class="del" onclick="supprimerSession(event,\'' + s.id + '\')">×</span>';
+d.onclick = () => { session = s.id; chargerHistorique(); chargerSessions(); };
+box.appendChild(d);
+});
+document.getElementById('session-info').textContent = session ? ('Session : ' + session) : 'Session courante';
+} catch(e){}
+}
+
+async function supprimerSession(ev, sid){
+ev.stopPropagation();
+if (!confirm('Supprimer cette session ?')) return;
+await fetch('/api/sessions/delete', {method:'POST', headers:{'Content-Type':'application/json'}, body
